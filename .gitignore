@@ -1,0 +1,4 @@
+/pretrained/
+/data/
+/all_checkpoints/
+!.gitignore
