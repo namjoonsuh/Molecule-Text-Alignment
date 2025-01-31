@@ -1,4 +1,5 @@
 from transformers import BertTokenizer, BertConfig, BertLMHeadModel
+from transformers import T5ForConditionalGeneration, T5Tokenizer
 from torch.nn import functional as F
 from unicore.data import Dictionary
 from model.unimol_simple import SimpleUniMolModel
@@ -20,15 +21,23 @@ class LayerNorm(nn.LayerNorm):
 
 def init_tokenizer(bert_name):
     #bert_name = 'allenai/scibert_scivocab_uncased'
-    tokenizer = BertTokenizer.from_pretrained(bert_name)
-    tokenizer.add_special_tokens({"bos_token": "[DEC]"})
+    
+    if bert_name == 'sci_bert':
+        tokenizer = BertTokenizer.from_pretrained('allenai/scibert_scivocab_uncased')
+        tokenizer.add_special_tokens({"bos_token": "[DEC]"})
+    
+    if bert_name == 'molT5':
+        tokenizer = T5Tokenizer.from_pretrained("laituan245/molt5-large-caption2smiles", model_max_length=256)
+
     return tokenizer
 
-def init_sci_bert(bert_name):
-    #bert_name = 'allenai/scibert_scivocab_uncased'
-    encoder_config = BertConfig.from_pretrained(bert_name)
-    model = BertLMHeadModel.from_pretrained(bert_name, config=encoder_config).to(device)
-
+def init_text_encoder(bert_name):
+    if bert_name == 'sci_bert':
+        encoder_config = BertConfig.from_pretrained('allenai/scibert_scivocab_uncased')
+        model = BertLMHeadModel.from_pretrained('allenai/scibert_scivocab_uncased', config=encoder_config).to(device)
+    
+    if bert_name == 'molT5':
+        model = T5ForConditionalGeneration.from_pretrained('laituan245/molt5-large-caption2smiles')
     return model
 
 def init_unimol_encoder(args):
@@ -74,22 +83,23 @@ def computeNCELoss(embed_A, embed_B, temperature_gt):
     loss_B = F.cross_entropy(logits_per_B, labels)
     loss = (loss_A + loss_B)/2
     return loss
-
+    
 class MolTextAligner(nn.Module):
 
     def __init__(self, args):
         super(MolTextAligner,self).__init__()
 
         self.temperature = args.temperature
-        self.sci_bert = init_sci_bert(args.bert_name)
         self.tokenizer = init_tokenizer(args.bert_name)
-        self.sci_bert.resize_token_embeddings(len(self.tokenizer))
-        state_dict = self.sci_bert.state_dict()
-        for name, param in self.sci_bert.named_parameters():
+        self.text_encoder = init_text_encoder(args.bert_name).to(device)
+        self.text_encoder.resize_token_embeddings(len(self.tokenizer))
+        state_dict = self.text_encoder.state_dict()
+        for name, param in self.text_encoder.named_parameters():
             if "_query" in name:
                 key_orig = name.replace("_query", "")
                 param.data.copy_(state_dict[key_orig])
-        
+
+        self.bert_name = args.bert_name
         self.uni_mol_encoder, _, _ = init_unimol_encoder(args)
         self.ae_model = init_smiles_encoder(args)
         
@@ -97,24 +107,15 @@ class MolTextAligner(nn.Module):
         self.ThreeD_proj = nn.Linear(args.unimol_encoder_embed_dim, args.embed_dim).to(device)
         self.Text_proj = nn.Linear(args.text_encoder_embed_dim, args.embed_dim).to(device)
 
-    def computeNCELoss(embed_A, embed_B, temperature_gt):
-        batch_size = embed_A.size(0)
-        cos_sim = torch.mm(embed_A, embed_B.transpose(0, 1))
-        logits_per_A = cos_sim/temperature_gt
-        logits_per_B = logits_per_A.transpose(0,1)
-
-        labels = torch.arange(batch_size, dtype=torch.long)
-        loss_A = F.cross_entropy(logits_per_A, labels)
-        loss_B = F.cross_entropy(logits_per_B, labels)
-        loss = (loss_A + loss_B)/2
-        return loss
-    
     def forward(self, smiles_tokens, padded_atom_vec, padded_dist, padded_edge_type, token_idxs, attention_masks):
         
         with torch.no_grad():
             batch_Smiles = AE_SMILES_encoder(smiles_tokens, self.ae_model)
             batch_ThreeD, _ = self.uni_mol_encoder(padded_atom_vec, padded_dist, padded_edge_type)
-            batch_Text = self.sci_bert.bert(token_idxs, attention_masks, return_dict=True)
+            if self.bert_name == 'sci_bert':
+                batch_Text = self.text_encoder.bert(token_idxs, attention_masks, return_dict=True)
+            if self.bert_name == 'molT5':
+                batch_Text = self.text_encoder.encoder(token_idxs, attention_masks, return_dict=True)
 
         Smiles_embed = self.Smiles_proj(torch.mean(batch_Smiles, dim=1))
         ThreeD_embed = self.ThreeD_proj(torch.mean(batch_ThreeD, dim=1))
